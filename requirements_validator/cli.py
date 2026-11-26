@@ -45,7 +45,7 @@ def main(argv: list[str] | None = None) -> int:
             os.getenv("GEMINI_API_KEY", ""),
             model,
             timeout=int(os.getenv("GEMINI_TIMEOUT_SECONDS", "180")),
-            max_retries=int(os.getenv("GEMINI_MAX_RETRIES", "3")),
+            max_retries=int(os.getenv("GEMINI_MAX_RETRIES", "5")),
         )
         result = AuditPipeline(client, args.chunk_chars, args.batch_size).run(document, progress)
         timezone = _timezone(os.getenv("REPORT_TIMEZONE", "Asia/Almaty"))

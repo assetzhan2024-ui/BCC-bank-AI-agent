@@ -52,23 +52,40 @@ def _read_plain_text(path: Path) -> str:
 
 
 def _read_pdf(path: Path) -> tuple[str, list[str]]:
-    from pypdf import PdfReader
+    """pdfplumber keeps word spacing and order on justified text; pypdf is a fallback."""
+    warnings: list[str] = []
+    try:
+        page_texts = _pdf_pages_pdfplumber(path)
+    except Exception as exc:  # pragma: no cover - depends on the PDF
+        warnings.append(f"pdfplumber не смог прочитать PDF ({exc}); использован pypdf, возможны склеенные слова.")
+        page_texts = _pdf_pages_pypdf(path)
 
-    reader = PdfReader(path)
     pages: list[str] = []
     empty_pages: list[int] = []
-    for number, page in enumerate(reader.pages, start=1):
-        value = (page.extract_text() or "").strip()
+    for number, value in enumerate(page_texts, start=1):
+        value = (value or "").strip()
         if not value:
             empty_pages.append(number)
         pages.append(f"\n[Страница {number}]\n{value}")
 
-    warnings = []
     if empty_pages:
         listed = ", ".join(map(str, empty_pages[:20]))
         suffix = "…" if len(empty_pages) > 20 else ""
         warnings.append(f"В PDF не извлечён текст со страниц: {listed}{suffix}. Возможно, нужен OCR.")
     return "\n".join(pages), warnings
+
+
+def _pdf_pages_pdfplumber(path: Path) -> list[str]:
+    import pdfplumber
+
+    with pdfplumber.open(path) as pdf:
+        return [page.extract_text() or "" for page in pdf.pages]
+
+
+def _pdf_pages_pypdf(path: Path) -> list[str]:
+    from pypdf import PdfReader
+
+    return [page.extract_text() or "" for page in PdfReader(path).pages]
 
 
 def _read_docx(path: Path) -> str:

@@ -27,6 +27,7 @@ class Requirement:
     quote: str
     summary: str
     source_chunk: int
+    location: str = ""
 
 
 @dataclass
@@ -37,6 +38,8 @@ class Issue:
     explanation: str
     risk: str
     recommendation: str
+    location: str = ""
+    evidence_exact: bool = True
 
 
 @dataclass
@@ -55,11 +58,13 @@ class SpecificationIssue:
     explanation: str
     risk: str
     recommendation: str
+    locations: list[str] = field(default_factory=list)
 
 
 @dataclass
 class SpecificationReview:
     issues: list[SpecificationIssue] = field(default_factory=list)
+    completed: bool = True
 
 
 @dataclass
