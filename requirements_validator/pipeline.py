@@ -4,7 +4,7 @@ import json
 from collections.abc import Callable
 
 from .chunking import split_text
-from .errors import LLMError
+from .errors import FatalLLMError, LLMError
 from .models import (
     AuditResult,
     DocumentContent,
@@ -25,7 +25,7 @@ SPEC_REVIEW_MAX_CHARS = 400_000
 
 
 class AuditPipeline:
-    def __init__(self, client, chunk_chars: int = 18_000, review_batch_size: int = 10) -> None:
+    def __init__(self, client, chunk_chars: int = 18_000, review_batch_size: int = 50) -> None:
         if review_batch_size < 1:
             raise ValueError("batch-size must be at least 1")
         self.client = client
@@ -39,7 +39,9 @@ class AuditPipeline:
         progress(f"1/4 Извлечение требований: {len(chunks)} фрагмент(ов)")
         requirements = self._extract_requirements(document, chunks, source, warnings)
         if not requirements:
-            raise LLMError("Агент не смог выделить ни одного требования из документа.")
+            reasons = [w for w in warnings if w not in document.warnings][:3]
+            detail = ("\nПричина:\n- " + "\n- ".join(reasons)) if reasons else ""
+            raise LLMError("Агент не смог выделить ни одного требования из документа." + detail)
 
         progress(f"2/4 Поэлементная проверка: {len(requirements)} требовани(й)")
         reviews = self._review_requirements(document, requirements, source, warnings, progress)
@@ -60,6 +62,8 @@ class AuditPipeline:
             )
             try:
                 payload = self.client.generate_json(system, user)
+            except FatalLLMError:
+                raise
             except LLMError as exc:
                 warnings.append(f"Фрагмент {chunk.index} не обработан при извлечении: {exc}")
                 continue
@@ -116,12 +120,13 @@ class AuditPipeline:
         for batch in batches:
             self._review_batch(system, document, batch, by_id, source, result, warnings)
 
-        # Retry whatever the model skipped or failed on, one requirement per call.
+        # Retry whatever the model skipped or failed on, in as few calls as possible:
+        # free Gemini quotas are counted in requests, not tokens.
         missing = [r for r in requirements if r.report_id not in result]
         if missing:
             progress(f"    Повторная проверка пропущенных требований: {len(missing)}")
-            for requirement in missing:
-                self._review_batch(system, document, [requirement], by_id, source, result, warnings)
+            for i in range(0, len(missing), self.review_batch_size):
+                self._review_batch(system, document, missing[i : i + self.review_batch_size], by_id, source, result, warnings)
 
         reviews: list[RequirementReview] = []
         for requirement in requirements:
@@ -139,6 +144,8 @@ class AuditPipeline:
         )
         try:
             payload = self.client.generate_json(system, user)
+        except FatalLLMError:
+            raise
         except LLMError as exc:
             ids = ", ".join(r.report_id for r in batch)
             warnings.append(f"Запрос поэлементной проверки ({ids}) завершился ошибкой: {exc}")
@@ -171,6 +178,8 @@ class AuditPipeline:
         )
         try:
             payload = self.client.generate_json(system, user)
+        except FatalLLMError:
+            raise
         except LLMError as exc:
             warnings.append(f"Системная проверка набора не выполнена: {exc}")
             return SpecificationReview([], completed=False)

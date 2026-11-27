@@ -92,9 +92,7 @@ class PipelineFixTests(unittest.TestCase):
         self.assertEqual(["OK", "OK"], [r.status for r in result.requirement_reviews])
 
     def test_failed_batch_does_not_crash_run(self):
-        client = ScriptedClient(
-            [EXTRACT, LLMError("boom"), LLMError("boom"), LLMError("boom"), {"issues": []}]
-        )
+        client = ScriptedClient([EXTRACT, LLMError("boom"), LLMError("boom"), {"issues": []}])
         result = AuditPipeline(client).run(self.document(), lambda _m: None)
         self.assertEqual(["НЕ ПРОВЕРЕНО", "НЕ ПРОВЕРЕНО"], [r.status for r in result.requirement_reviews])
 
@@ -218,6 +216,53 @@ class VersionTests(unittest.TestCase):
                 self.assertIn("2.0.0", agent_version(Path(directory)))
 
 
+class Gemini2026Tests(unittest.TestCase):
+    """Free-tier limits, model changes and fail-fast behaviour."""
+
+    def document(self):
+        return DocumentContent("doc.md", "/doc.md", DOC)
+
+    def test_missing_reviews_are_retried_in_one_request(self):
+        three = {"requirements": EXTRACT["requirements"] + [
+            {"document_id": "", "section": "S", "quote": "Для чужой карты возвращается 404, как и для отсутствующей карты.", "summary": "404"}]}
+        client = ScriptedClient(
+            [
+                three,
+                {"reviews": [{"requirement_id": "REQ-001", "issues": []}]},
+                {"reviews": [{"requirement_id": "REQ-002", "issues": []}, {"requirement_id": "REQ-003", "issues": []}]},
+                {"issues": []},
+            ]
+        )
+        result = AuditPipeline(client).run(self.document(), lambda _m: None)
+        self.assertEqual(4, len(client.prompts))
+        self.assertEqual(["OK", "OK", "OK"], [r.status for r in result.requirement_reviews])
+
+    def test_whole_run_uses_three_requests_by_default(self):
+        client = ScriptedClient(
+            [
+                EXTRACT,
+                {"reviews": [{"requirement_id": "REQ-001", "issues": []}, {"requirement_id": "REQ-002", "issues": []}]},
+                {"issues": []},
+            ]
+        )
+        AuditPipeline(client).run(self.document(), lambda _m: None)
+        self.assertEqual(3, len(client.prompts))
+
+    def test_fatal_error_stops_run_without_more_requests(self):
+        from requirements_validator.errors import FatalLLMError
+
+        client = ScriptedClient([EXTRACT, FatalLLMError("HTTP 404 model not found")])
+        with self.assertRaises(FatalLLMError):
+            AuditPipeline(client).run(self.document(), lambda _m: None)
+        self.assertEqual(2, len(client.prompts))
+
+    def test_empty_extraction_explains_the_reason(self):
+        client = ScriptedClient([LLMError("HTTP 503: overloaded")])
+        with self.assertRaises(LLMError) as ctx:
+            AuditPipeline(client).run(self.document(), lambda _m: None)
+        self.assertIn("HTTP 503: overloaded", str(ctx.exception))
+
+
 class FakeResponse:
     def __init__(self, status, payload, headers=None):
         self.status_code = status
@@ -256,6 +301,61 @@ class GeminiClientTests(unittest.TestCase):
         self.assertIn("API key not valid", str(ctx.exception))
         self.assertEqual([], sleeps)
         self.assertEqual(1, client.session.post.call_count)
+
+
+class QuotaClassificationTests(unittest.TestCase):
+    def make(self, responses):
+        sleeps = []
+        client = GeminiClient("key", "model", max_retries=3, sleep=sleeps.append)
+        client.session = mock.Mock()
+        client.session.post.side_effect = responses
+        return client, sleeps
+
+    @staticmethod
+    def quota(quota_id, delay=None):
+        details = [{"@type": "type.googleapis.com/google.rpc.QuotaFailure",
+                    "violations": [{"quotaMetric": "generativelanguage.googleapis.com/generate_content_free_tier_requests",
+                                    "quotaId": quota_id}]}]
+        if delay:
+            details.append({"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": delay})
+        message = "You exceeded your current quota, please check your plan and billing details."
+        return FakeResponse(429, {"error": {"code": 429, "message": message, "details": details}})
+
+    def test_per_minute_limit_with_quota_text_waits_and_retries(self):
+        limited = self.quota("GenerateRequestsPerMinutePerProjectPerModel-FreeTier", "20s")
+        client, sleeps = self.make([limited, _ok({"ok": True})])
+        with mock.patch("builtins.print"):
+            self.assertEqual({"ok": True}, client.generate_json("s", "u"))
+        self.assertEqual([21.0], sleeps)
+
+    def test_daily_limit_fails_fast(self):
+        from requirements_validator.errors import QuotaExceededError
+
+        client, sleeps = self.make([self.quota("GenerateRequestsPerDayPerProjectPerModel-FreeTier", "40s")])
+        with self.assertRaises(QuotaExceededError) as ctx:
+            client.generate_json("s", "u")
+        self.assertIn("13:00", str(ctx.exception))
+        self.assertEqual([], sleeps)
+
+    def test_unknown_model_is_fatal_with_api_reason(self):
+        from requirements_validator.errors import FatalLLMError
+
+        gone = FakeResponse(404, {"error": {"message": "This model models/gemini-2.5-flash is no longer available to new users."}})
+        client, sleeps = self.make([gone])
+        with self.assertRaises(FatalLLMError) as ctx:
+            client.generate_json("s", "u")
+        self.assertIn("no longer available", str(ctx.exception))
+        self.assertEqual(1, client.session.post.call_count)
+
+
+class CliDefaultsTests(unittest.TestCase):
+    def test_default_model_is_current(self):
+        from requirements_validator import cli
+
+        self.assertEqual("gemini-3.8-flash", cli.DEFAULT_MODEL)
+        example = (Path(__file__).resolve().parent.parent / ".env.example").read_text(encoding="utf-8")
+        self.assertIn("GEMINI_MODEL=gemini-3.8-flash", example)
+        self.assertRegex(example, r"(?m)^GEMINI_API_KEY=$")
 
 
 if __name__ == "__main__":

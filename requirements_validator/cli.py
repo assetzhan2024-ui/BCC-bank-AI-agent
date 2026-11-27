@@ -17,6 +17,7 @@ from .report import build_report, write_report
 from .versioning import agent_version
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_MODEL = "gemini-3.8-flash"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -28,7 +29,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", "-o", required=True, help="Путь к итоговому Markdown-отчёту")
     parser.add_argument("--model", help="Имя Gemini-модели; переопределяет GEMINI_MODEL")
     parser.add_argument("--chunk-chars", type=int, default=18_000, help="Максимальный размер фрагмента документа")
-    parser.add_argument("--batch-size", type=int, default=10, help="Требований в одном запросе поэлементной проверки")
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=50,
+        help="Требований в одном запросе поэлементной проверки (больше = меньше запросов к API)",
+    )
     parser.add_argument("--quiet", action="store_true", help="Не показывать этапы выполнения")
     return parser
 
@@ -39,8 +45,8 @@ def main(argv: list[str] | None = None) -> int:
     progress = (lambda _message: None) if args.quiet else (lambda message: print(message, flush=True))
 
     try:
-        document = read_document(args.input)
-        model = args.model or os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+        document = read_document(_resolve_path(args.input))
+        model = args.model or os.getenv("GEMINI_MODEL") or DEFAULT_MODEL
         client = GeminiClient(
             os.getenv("GEMINI_API_KEY", ""),
             model,
@@ -56,7 +62,7 @@ def main(argv: list[str] | None = None) -> int:
             agent_version(PROJECT_ROOT),
             datetime.now(timezone),
         )
-        output = write_report(args.output, content)
+        output = write_report(_resolve_path(args.output, must_exist=False), content)
         print(f"Готово. Отчёт сохранён: {output}")
         return 0
     except (ValidatorError, ValueError) as exc:
@@ -72,3 +78,14 @@ def _timezone(name: str):
         return ZoneInfo(name)
     except ZoneInfoNotFoundError:
         return ZoneInfo("UTC")
+
+
+def _resolve_path(value: str, must_exist: bool = True) -> Path:
+    """Relative paths work both from the current folder and from the project folder."""
+    path = Path(value).expanduser()
+    if path.is_absolute():
+        return path
+    from_cwd = Path.cwd() / path
+    if from_cwd.exists() or (not must_exist and from_cwd.parent.exists()):
+        return from_cwd
+    return PROJECT_ROOT / path

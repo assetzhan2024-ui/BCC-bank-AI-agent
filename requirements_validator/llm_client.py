@@ -7,7 +7,7 @@ from typing import Any
 
 import requests
 
-from .errors import LLMError
+from .errors import FatalLLMError, LLMError, QuotaExceededError
 
 RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
 # Free-tier Gemini limits are per minute, so a 429 needs a long pause.
@@ -62,6 +62,14 @@ class GeminiClient:
                     self._sleep(_backoff(attempt))
                 continue
 
+            if response.status_code == 429 and _is_daily_quota(response):
+                raise QuotaExceededError(
+                    f"Дневная квота Gemini исчерпана ({_error_message(response)}). "
+                    "Повторы не помогут: квота сбрасывается в полночь по тихоокеанскому времени "
+                    "(13:00 по Алматы). Можно использовать ключ из другого Google-проекта: "
+                    "лимиты считаются на проект, а не на ключ."
+                )
+
             if response.status_code in RETRYABLE_STATUSES:
                 last_error = f"HTTP {response.status_code}: {_error_message(response)}"
                 if not is_last:
@@ -69,15 +77,15 @@ class GeminiClient:
                     if response.status_code == 429 and wait is None:
                         wait = RATE_LIMIT_DEFAULT_WAIT
                     wait = min(wait if wait is not None else _backoff(attempt), MAX_WAIT_SECONDS)
-                    print(f"    Gemini: {last_error}. Повтор через {wait:.0f} с ({attempt}/{self.max_retries})", flush=True)
+                    print(f"    Gemini: {last_error.rstrip('.')}. Повтор через {wait:.0f} с ({attempt}/{self.max_retries})", flush=True)
                     self._sleep(wait)
                 continue
 
             if response.status_code >= 400:
-                # 400/401/403/404 will not fix themselves: fail fast with the API's reason.
-                raise LLMError(
-                    f"Gemini API вернул HTTP {response.status_code}: {_error_message(response)}. "
-                    "Проверьте GEMINI_API_KEY и имя модели GEMINI_MODEL."
+                # 400/401/403/404 will not fix themselves: stop the run with the API's reason.
+                raise FatalLLMError(
+                    f"Gemini API вернул HTTP {response.status_code}: {_error_message(response)} "
+                    f"Проверьте GEMINI_API_KEY в .env и имя модели (сейчас: {self.model})."
                 )
 
             try:
@@ -124,6 +132,36 @@ def _retry_after(response) -> float | None:
             if match:
                 return float(match.group(1)) + 1.0
     return None
+
+
+def _is_daily_quota(response) -> bool:
+    """True only for a used-up per-day quota.
+
+    Gemini sends the same "You exceeded your current quota" text for the short
+    per-minute limit, so the text alone cannot be trusted. The QuotaFailure
+    details name the quota: "...PerDay..." is daily, "...PerMinute..." passes
+    on its own and is handled by waiting. A limit of 0 means the model has no
+    free quota at all for this project.
+    """
+    try:
+        payload = response.json()
+    except ValueError:
+        return False
+    error = payload.get("error", {}) if isinstance(payload, dict) else {}
+    message = str(error.get("message", "")).casefold()
+    if "limit: 0" in message:
+        return True
+    quota_ids: list[str] = []
+    for detail in error.get("details", []) or []:
+        if not isinstance(detail, dict):
+            continue
+        for violation in detail.get("violations", []) or []:
+            if isinstance(violation, dict):
+                quota_ids.append(str(violation.get("quotaId", "")) + str(violation.get("quotaMetric", "")))
+    joined = " ".join(quota_ids).casefold()
+    if "perminute" in joined:
+        return False
+    return "perday" in joined
 
 
 def _parse_gemini_json(payload: dict[str, Any]) -> dict[str, Any]:
